@@ -13,6 +13,20 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 
+CREATE EXTENSION IF NOT EXISTS "pg_cron" WITH SCHEMA "pg_catalog";
+
+
+
+
+
+
+CREATE EXTENSION IF NOT EXISTS "pg_net" WITH SCHEMA "extensions";
+
+
+
+
+
+
 COMMENT ON SCHEMA "public" IS 'standard public schema';
 
 
@@ -39,6 +53,13 @@ CREATE EXTENSION IF NOT EXISTS "pgcrypto" WITH SCHEMA "extensions";
 
 
 CREATE EXTENSION IF NOT EXISTS "supabase_vault" WITH SCHEMA "vault";
+
+
+
+
+
+
+CREATE EXTENSION IF NOT EXISTS "unaccent" WITH SCHEMA "public";
 
 
 
@@ -108,6 +129,16 @@ CREATE TYPE "public"."tarifa_acceso" AS ENUM (
 
 
 ALTER TYPE "public"."tarifa_acceso" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."tarifa_electrica" AS ENUM (
+    '2.0TD',
+    '3.0TD',
+    '6.1TD'
+);
+
+
+ALTER TYPE "public"."tarifa_electrica" OWNER TO "postgres";
 
 
 CREATE TYPE "public"."tipo_cliente" AS ENUM (
@@ -505,48 +536,49 @@ $_$;
 
 ALTER FUNCTION "public"."is_valid_uuid"("uuid_text" "text") OWNER TO "postgres";
 
+SET default_tablespace = '';
 
-CREATE OR REPLACE FUNCTION "public"."search_clientes"("search_text" "text") RETURNS TABLE("id" "uuid", "empresa_id" "uuid", "tipo" "text", "nombre" "text", "dni" "text", "cif" "text", "email_facturacion" "text", "creado_en" timestamp with time zone, "estado" "text", "comerciales_asignados" json)
-    LANGUAGE "sql"
+SET default_table_access_method = "heap";
+
+
+CREATE TABLE IF NOT EXISTS "public"."clientes" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "empresa_id" "uuid" NOT NULL,
+    "tipo" "public"."tipo_cliente" NOT NULL,
+    "nombre" "text" NOT NULL,
+    "dni" "text",
+    "cif" "text",
+    "email_facturacion" "text",
+    "creado_en" timestamp with time zone DEFAULT "now"(),
+    "estado" "public"."estado_cliente" DEFAULT 'stand by'::"public"."estado_cliente" NOT NULL
+);
+
+
+ALTER TABLE "public"."clientes" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."clientes" IS 'Clientes finales (titulares) de cada empresa/comercializadora. Pueden ser persona (DNI) o sociedad (CIF).';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."search_clientes"("search_text" "text") RETURNS SETOF "public"."clientes"
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO 'public'
     AS $$
-SELECT
-    -- Selecciona explícitamente las columnas de clientes que coinciden con RETURNS TABLE
-    c.id,
-    c.empresa_id,
-    c.tipo,
-    c.nombre,
-    c.dni,
-    c.cif,
-    c.email_facturacion,
-    c.creado_en,
-    c.estado,
-    -- Añadir aquí el resto de columnas de 'clientes' si las hay
-    -- ...
-    -- La subconsulta para comerciales (igual que antes)
-    (
-        SELECT COALESCE(json_agg(json_build_object('nombre', u.nombre, 'apellidos', u.apellidos)), '[]'::json)
-        FROM asignaciones_comercial ac
-        JOIN usuarios_app u ON ac.comercial_user_id = u.user_id
-        WHERE ac.cliente_id = c.id
-    ) as comerciales_asignados
-FROM
-    clientes c
-LEFT JOIN
-    empresas e ON c.empresa_id = e.id
-WHERE
-    search_text IS NULL OR search_text = '' OR
-    c.nombre ILIKE ('%' || search_text || '%') OR
-    c.dni ILIKE ('%' || search_text || '%') OR
-    c.cif ILIKE ('%' || search_text || '%') OR
-    e.nombre ILIKE ('%' || search_text || '%');
+  select c.*
+  from public.clientes c
+  left join public.empresas e on e.id = c.empresa_id
+  where
+    coalesce(search_text, '') = ''
+    or unaccent(c.nombre) ilike '%' || unaccent(search_text) || '%'
+    or unaccent(coalesce(c.dni,'')) ilike '%' || unaccent(search_text) || '%'
+    or unaccent(coalesce(c.cif,'')) ilike '%' || unaccent(search_text) || '%'
+    or unaccent(e.nombre) ilike '%' || unaccent(search_text) || '%'
+  order by c.creado_en desc
 $$;
 
 
 ALTER FUNCTION "public"."search_clientes"("search_text" "text") OWNER TO "postgres";
-
-SET default_tablespace = '';
-
-SET default_table_access_method = "heap";
 
 
 CREATE TABLE IF NOT EXISTS "public"."contratos" (
@@ -756,26 +788,6 @@ ALTER SEQUENCE "public"."chat_history_id_seq" OWNED BY "public"."chat_history"."
 
 
 
-CREATE TABLE IF NOT EXISTS "public"."clientes" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "empresa_id" "uuid" NOT NULL,
-    "tipo" "public"."tipo_cliente" NOT NULL,
-    "nombre" "text" NOT NULL,
-    "dni" "text",
-    "cif" "text",
-    "email_facturacion" "text",
-    "creado_en" timestamp with time zone DEFAULT "now"(),
-    "estado" "public"."estado_cliente" DEFAULT 'stand by'::"public"."estado_cliente" NOT NULL
-);
-
-
-ALTER TABLE "public"."clientes" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."clientes" IS 'Clientes finales (titulares) de cada empresa/comercializadora. Pueden ser persona (DNI) o sociedad (CIF).';
-
-
-
 CREATE TABLE IF NOT EXISTS "public"."comparativas" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "creado_por_user_id" "uuid" NOT NULL,
@@ -870,7 +882,10 @@ CREATE TABLE IF NOT EXISTS "public"."empresas" (
     "nombre" "text" NOT NULL,
     "cif" "text",
     "tipo" "public"."tipo_empresa" NOT NULL,
-    "creada_en" timestamp with time zone DEFAULT "now"()
+    "creada_en" timestamp with time zone DEFAULT "now"(),
+    "is_archived" boolean DEFAULT false NOT NULL,
+    "archived_at" timestamp with time zone,
+    "logo_url" "text"
 );
 
 
@@ -962,6 +977,50 @@ ALTER TABLE "public"."notificaciones" OWNER TO "postgres";
 
 
 COMMENT ON TABLE "public"."notificaciones" IS 'Programación y registro de avisos (principalmente renovaciones). Mantiene destinatarios, estado y trazabilidad del envío.';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."precios_energia" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "empresa_id" "uuid" NOT NULL,
+    "tarifa" "public"."tarifa_electrica" NOT NULL,
+    "fecha_mes" "date" NOT NULL,
+    "precio_energia_p1" numeric(10,6),
+    "precio_energia_p2" numeric(10,6),
+    "precio_energia_p3" numeric(10,6),
+    "precio_energia_p4" numeric(10,6),
+    "precio_energia_p5" numeric(10,6),
+    "precio_energia_p6" numeric(10,6),
+    "creado_en" timestamp with time zone DEFAULT "now"()
+);
+
+
+ALTER TABLE "public"."precios_energia" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."precios_potencia" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "empresa_id" "uuid" NOT NULL,
+    "tarifa" "public"."tarifa_electrica" NOT NULL,
+    "año" integer NOT NULL,
+    "precio_potencia_p1" numeric(10,6),
+    "precio_potencia_p2" numeric(10,6),
+    "precio_potencia_p3" numeric(10,6),
+    "precio_potencia_p4" numeric(10,6),
+    "precio_potencia_p5" numeric(10,6),
+    "precio_potencia_p6" numeric(10,6),
+    "creado_en" timestamp with time zone DEFAULT "now"()
+);
+
+
+ALTER TABLE "public"."precios_potencia" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."precios_potencia" IS 'Almacena los precios de potencia (€/kW/año) por empresa, tarifa y año.';
+
+
+
+COMMENT ON COLUMN "public"."precios_potencia"."año" IS 'Año de vigencia del precio (Ej: 2024, 2025).';
 
 
 
@@ -1103,6 +1162,26 @@ ALTER TABLE ONLY "public"."notificaciones"
 
 
 
+ALTER TABLE ONLY "public"."precios_energia"
+    ADD CONSTRAINT "precios_energia_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."precios_energia"
+    ADD CONSTRAINT "precios_energia_unico_mes_tarifa_empresa" UNIQUE ("empresa_id", "tarifa", "fecha_mes");
+
+
+
+ALTER TABLE ONLY "public"."precios_potencia"
+    ADD CONSTRAINT "precios_potencia_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."precios_potencia"
+    ADD CONSTRAINT "precios_potencia_unico_año_tarifa_empresa" UNIQUE ("empresa_id", "tarifa", "año");
+
+
+
 ALTER TABLE ONLY "public"."puntos_suministro"
     ADD CONSTRAINT "puntos_suministro_cliente_id_cups_key" UNIQUE ("cliente_id", "cups");
 
@@ -1237,6 +1316,10 @@ CREATE INDEX "idx_contratos_fecha_fin" ON "public"."contratos" USING "btree" ("f
 
 
 CREATE INDEX "idx_documentos_cliente_visible" ON "public"."documentos" USING "btree" ("cliente_id", "visible_para_cliente") WHERE ("visible_para_cliente" = true);
+
+
+
+CREATE INDEX "idx_empresas_is_archived" ON "public"."empresas" USING "btree" ("is_archived");
 
 
 
@@ -1440,6 +1523,16 @@ ALTER TABLE ONLY "public"."notificaciones"
 
 ALTER TABLE ONLY "public"."notificaciones"
     ADD CONSTRAINT "notificaciones_user_id_destinatario_fkey" FOREIGN KEY ("user_id_destinatario") REFERENCES "public"."usuarios_app"("user_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."precios_energia"
+    ADD CONSTRAINT "precios_energia_empresa_id_fkey" FOREIGN KEY ("empresa_id") REFERENCES "public"."empresas"("id");
+
+
+
+ALTER TABLE ONLY "public"."precios_potencia"
+    ADD CONSTRAINT "precios_potencia_empresa_id_fkey" FOREIGN KEY ("empresa_id") REFERENCES "public"."empresas"("id") ON DELETE CASCADE;
 
 
 
@@ -1725,10 +1818,37 @@ ALTER PUBLICATION "supabase_realtime" OWNER TO "postgres";
 
 
 
+
+
+
+
+
+
 GRANT USAGE ON SCHEMA "public" TO "postgres";
 GRANT USAGE ON SCHEMA "public" TO "anon";
 GRANT USAGE ON SCHEMA "public" TO "authenticated";
 GRANT USAGE ON SCHEMA "public" TO "service_role";
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -1972,6 +2092,12 @@ GRANT ALL ON FUNCTION "public"."is_valid_uuid"("uuid_text" "text") TO "service_r
 
 
 
+GRANT ALL ON TABLE "public"."clientes" TO "anon";
+GRANT ALL ON TABLE "public"."clientes" TO "authenticated";
+GRANT ALL ON TABLE "public"."clientes" TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."search_clientes"("search_text" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."search_clientes"("search_text" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."search_clientes"("search_text" "text") TO "service_role";
@@ -2005,6 +2131,40 @@ GRANT ALL ON FUNCTION "public"."search_puntos_suministro"("search_text" "text", 
 GRANT ALL ON FUNCTION "public"."set_folder_visibility"("p_cliente_id" "uuid", "p_folder_path" "text", "p_is_visible" boolean) TO "anon";
 GRANT ALL ON FUNCTION "public"."set_folder_visibility"("p_cliente_id" "uuid", "p_folder_path" "text", "p_is_visible" boolean) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."set_folder_visibility"("p_cliente_id" "uuid", "p_folder_path" "text", "p_is_visible" boolean) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."unaccent"("text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."unaccent"("text") TO "anon";
+GRANT ALL ON FUNCTION "public"."unaccent"("text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."unaccent"("text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."unaccent"("regdictionary", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."unaccent"("regdictionary", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."unaccent"("regdictionary", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."unaccent"("regdictionary", "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."unaccent_init"("internal") TO "postgres";
+GRANT ALL ON FUNCTION "public"."unaccent_init"("internal") TO "anon";
+GRANT ALL ON FUNCTION "public"."unaccent_init"("internal") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."unaccent_init"("internal") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."unaccent_lexize"("internal", "internal", "internal", "internal") TO "postgres";
+GRANT ALL ON FUNCTION "public"."unaccent_lexize"("internal", "internal", "internal", "internal") TO "anon";
+GRANT ALL ON FUNCTION "public"."unaccent_lexize"("internal", "internal", "internal", "internal") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."unaccent_lexize"("internal", "internal", "internal", "internal") TO "service_role";
+
+
+
+
+
+
 
 
 
@@ -2044,12 +2204,6 @@ GRANT ALL ON TABLE "public"."chat_history" TO "service_role";
 GRANT ALL ON SEQUENCE "public"."chat_history_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."chat_history_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."chat_history_id_seq" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."clientes" TO "anon";
-GRANT ALL ON TABLE "public"."clientes" TO "authenticated";
-GRANT ALL ON TABLE "public"."clientes" TO "service_role";
 
 
 
@@ -2110,6 +2264,18 @@ GRANT ALL ON SEQUENCE "public"."lineas_factura_id_seq" TO "service_role";
 GRANT ALL ON TABLE "public"."notificaciones" TO "anon";
 GRANT ALL ON TABLE "public"."notificaciones" TO "authenticated";
 GRANT ALL ON TABLE "public"."notificaciones" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."precios_energia" TO "anon";
+GRANT ALL ON TABLE "public"."precios_energia" TO "authenticated";
+GRANT ALL ON TABLE "public"."precios_energia" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."precios_potencia" TO "anon";
+GRANT ALL ON TABLE "public"."precios_potencia" TO "authenticated";
+GRANT ALL ON TABLE "public"."precios_potencia" TO "service_role";
 
 
 
@@ -2192,8 +2358,6 @@ ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TAB
 
 
 
-drop extension if exists "pg_net";
-
 
   create policy "Permitir a usuarios subir su propio avatar 1oj01fe_0"
   on "storage"."objects"
@@ -2255,6 +2419,51 @@ with check (((bucket_id = 'documentos'::text) AND (public.current_user_role() = 
   for insert
   to public
 with check (((bucket_id = 'documentos'::text) AND public.is_valid_uuid(path_tokens[2]) AND public.can_access_cliente((path_tokens[2])::uuid) AND (public.current_user_role() <> 'cliente'::text)));
+
+
+
+  create policy "logos_empresas delete (admin)"
+  on "storage"."objects"
+  as permissive
+  for delete
+  to authenticated
+using (((bucket_id = 'logos_empresas'::text) AND (EXISTS ( SELECT 1
+   FROM public.usuarios_app ua
+  WHERE ((ua.user_id = auth.uid()) AND (ua.rol = 'administrador'::public.rol_usuario))))));
+
+
+
+  create policy "logos_empresas insert (admin)"
+  on "storage"."objects"
+  as permissive
+  for insert
+  to authenticated
+with check (((bucket_id = 'logos_empresas'::text) AND (EXISTS ( SELECT 1
+   FROM public.usuarios_app ua
+  WHERE ((ua.user_id = auth.uid()) AND (ua.rol = 'administrador'::public.rol_usuario))))));
+
+
+
+  create policy "logos_empresas select (authed)"
+  on "storage"."objects"
+  as permissive
+  for select
+  to authenticated
+using ((bucket_id = 'logos_empresas'::text));
+
+
+
+  create policy "logos_empresas update (admin)"
+  on "storage"."objects"
+  as permissive
+  for update
+  to authenticated
+using (((bucket_id = 'logos_empresas'::text) AND (EXISTS ( SELECT 1
+   FROM public.usuarios_app ua
+  WHERE ((ua.user_id = auth.uid()) AND (ua.rol = 'administrador'::public.rol_usuario))))))
+with check (((bucket_id = 'logos_empresas'::text) AND (EXISTS ( SELECT 1
+   FROM public.usuarios_app ua
+  WHERE ((ua.user_id = auth.uid()) AND (ua.rol = 'administrador'::public.rol_usuario))))));
 
 
 
